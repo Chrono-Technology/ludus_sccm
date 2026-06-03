@@ -63,6 +63,8 @@ NetBIOS names must be 15 characters or less in Active Directory.
 
 ## Setup and Deployment
 
+For a deployment-focused LLM/operator runbook, see [INSTRUCTIONS.md](INSTRUCTIONS.md).
+
 To deploy the lab via [Ansible Galaxy](https://galaxy.ansible.com/ui/repo/published/mayyhem/ludus_sccm/), clone the repository to a system where Ludus CLI is installed, then run:
 
 ```
