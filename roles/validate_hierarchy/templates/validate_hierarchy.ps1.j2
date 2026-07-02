@@ -1,0 +1,206 @@
+#Requires -Version 5
+# SCCM hierarchy validation - rendered by the validate_hierarchy Ansible role.
+# Walks the CAS -> PS1 -> SEC hierarchy and verifies sites, parent/child
+# relationships, versions, site server services, site system roles, SMS
+# Providers, database replication, and component health.
+# Exit 0 = all critical checks passed; exit 1 = one or more [FAIL] items.
+
+$ErrorActionPreference = 'Continue'
+$ProgressPreference    = 'SilentlyContinue'
+
+# ---- Expected topology (from Ansible vars) --------------------------------
+$domain  = '{{ ludus_sccm_validate_domain_fqdn }}'
+$casCode = '{{ ludus_sccm_validate_cas_sitecode }}'
+$psCode  = '{{ ludus_sccm_validate_primary_sitecode }}'
+$secCode = '{{ ludus_sccm_validate_secondary_sitecode }}'
+$casSrv  = '{{ ludus_sccm_validate_cas_server }}'
+$psSrv   = '{{ ludus_sccm_validate_primary_server }}'
+$secSrv  = '{{ ludus_sccm_validate_secondary_server }}'
+$casSql  = '{{ ludus_sccm_validate_cas_sql_host }}'
+$scpHost = '{{ ludus_sccm_validate_scp_host }}'
+$psSql   = '{{ ludus_sccm_validate_primary_sql_host }}'
+$mpHost  = '{{ ludus_sccm_validate_mp_host }}'
+$dpHost  = '{{ ludus_sccm_validate_dp_host }}'
+$smsHost = '{{ ludus_sccm_validate_sms_provider_host }}'
+$psvHost = '{{ ludus_sccm_validate_passive_host }}'
+$libHost = '{{ ludus_sccm_validate_contentlib_host }}'
+$expectVer = '{{ ludus_sccm_validate_expected_version }}'
+$requireVerConsistency = [bool]::Parse('{{ ludus_sccm_validate_require_version_consistency | bool | lower }}')
+$replMustBeActive      = [bool]::Parse('{{ ludus_sccm_validate_replication_must_be_active | bool | lower }}')
+
+function FQDN($h){ if($h -match '\.'){ $h } else { "$h.$domain" } }
+
+$script:fails = New-Object System.Collections.ArrayList
+$script:warns = New-Object System.Collections.ArrayList
+function Fail($m){ [void]$script:fails.Add($m); Write-Output "[FAIL] $m" }
+function Warn($m){ [void]$script:warns.Add($m); Write-Output "[WARN] $m" }
+function Pass($m){ Write-Output "[ OK ] $m" }
+function Section($m){ Write-Output ""; Write-Output "=== $m ===" }
+
+Write-Output "SCCM hierarchy validation @ $(Get-Date -Format s) on $env:COMPUTERNAME"
+Write-Output "Expected: $casCode(CAS) -> $psCode(Primary) -> $secCode(Secondary) in $domain"
+
+# ---- 1. SMS Provider connectivity -----------------------------------------
+Section "SMS Provider connectivity"
+$psNs  = "root\SMS\site_$psCode"
+$casNs = "root\SMS\site_$casCode"
+$psOk = $false; $casOk = $false
+try { $null = Get-CimInstance -ComputerName (FQDN $psSrv) -Namespace $psNs -ClassName SMS_Site -ErrorAction Stop; Pass "PS1 provider reachable at $(FQDN $psSrv) ($psNs)"; $psOk = $true }
+catch { Fail "PS1 provider NOT reachable at $(FQDN $psSrv) ($psNs): $($_.Exception.Message)" }
+try { $null = Get-CimInstance -ComputerName (FQDN $casSrv) -Namespace $casNs -ClassName SMS_Site -ErrorAction Stop; Pass "CAS provider reachable at $(FQDN $casSrv) ($casNs)"; $casOk = $true }
+catch { Fail "CAS provider NOT reachable at $(FQDN $casSrv) ($casNs): $($_.Exception.Message)" }
+
+if($casOk){ $provSrv = (FQDN $casSrv); $provNs = $casNs }
+elseif($psOk){ $provSrv = (FQDN $psSrv); $provNs = $psNs }
+else {
+    Fail "No SMS Provider reachable - cannot walk the hierarchy"
+    Section "RESULT"
+    Write-Output ("Failures: {0}  Warnings: {1}" -f $script:fails.Count, $script:warns.Count)
+    Write-Output "VALIDATION_RESULT=FAIL"
+    exit 1
+}
+Write-Output "Using provider $provSrv ($provNs) for hierarchy-wide queries"
+
+# ---- 2. Sites present + parent/child + types ------------------------------
+Section "Sites and hierarchy relationships"
+$sites = Get-CimInstance -ComputerName $provSrv -Namespace $provNs -ClassName SMS_Site -ErrorAction SilentlyContinue
+$defs  = Get-CimInstance -ComputerName $provSrv -Namespace $provNs -ClassName SMS_SCI_SiteDefinition -ErrorAction SilentlyContinue
+function ParentOf($code){
+    $d = $defs | Where-Object { $_.SiteCode -eq $code } | Select-Object -First 1
+    if($d){ return $d.ParentSiteCode }
+    $s = $sites | Where-Object { $_.SiteCode -eq $code } | Select-Object -First 1
+    if($s){ return $s.ReportingSiteCode }
+    return $null
+}
+# Type: 1=Secondary, 2=Primary, 4=CAS
+$expected = @(
+    @{ Code=$casCode; Type=4; Server=(FQDN $casSrv); Parent='';       Label='CAS (Central Administration Site)' },
+    @{ Code=$psCode;  Type=2; Server=(FQDN $psSrv);  Parent=$casCode; Label='PS1 (Primary Site)' },
+    @{ Code=$secCode; Type=1; Server=(FQDN $secSrv); Parent=$psCode;  Label='SEC (Secondary Site)' }
+)
+foreach($e in $expected){
+    $s = $sites | Where-Object { $_.SiteCode -eq $e.Code } | Select-Object -First 1
+    if(-not $s){ Fail "$($e.Label): site '$($e.Code)' missing from SMS_Site"; continue }
+    Pass "$($e.Label): present - server=$($s.ServerName), version=$($s.Version)"
+    if([int]$s.Type -ne $e.Type){ Fail "$($e.Code): Type=$($s.Type) but expected $($e.Type)" }
+    $p = ParentOf $e.Code
+    if($null -eq $p){ Warn "$($e.Code): could not determine parent site" }
+    elseif(($p | Out-String).Trim() -ne $e.Parent){ Fail "$($e.Code): parent='$(($p | Out-String).Trim())' but expected '$($e.Parent)'" }
+    elseif($e.Parent){ Pass "$($e.Code) is correctly a child of $($e.Parent)" }
+    else { Pass "$($e.Code) is correctly the top-level site (no parent)" }
+}
+
+# ---- 3. Versions ----------------------------------------------------------
+Section "Site versions"
+$verRows = $sites | Where-Object { @($casCode,$psCode,$secCode) -contains $_.SiteCode }
+foreach($v in $verRows){ Write-Output ("  {0} = {1}" -f $v.SiteCode, $v.Version) }
+if($expectVer){
+    foreach($v in $verRows){
+        if($v.Version -ne $expectVer){ Fail "$($v.SiteCode) version $($v.Version) != expected $expectVer" }
+        else { Pass "$($v.SiteCode) at expected version $expectVer" }
+    }
+} elseif($requireVerConsistency){
+    $distinct = @($verRows.Version | Sort-Object -Unique)
+    if($distinct.Count -gt 1){ Fail "Sites are on MIXED versions ($($distinct -join ', ')) - upgrade likely incomplete" }
+    elseif($distinct.Count -eq 1){ Pass "All sites on the same version: $($distinct[0])" }
+}
+
+# ---- 4. Site server services ----------------------------------------------
+Section "Site server services"
+function Check-Service($label, $host, $svcName, $hard){
+    try{
+        $svc = Get-CimInstance -ComputerName (FQDN $host) -ClassName Win32_Service -Filter "Name='$svcName'" -ErrorAction Stop
+        if(-not $svc){ if($hard){ Fail "$label ($host): $svcName not installed" } else { Warn "$label ($host): $svcName not installed" }; return }
+        if($svc.State -eq 'Running'){ Pass "$label ($host): $svcName Running" }
+        else { if($hard){ Fail "$label ($host): $svcName is $($svc.State) (expected Running)" } else { Warn "$label ($host): $svcName is $($svc.State)" } }
+    } catch { if($hard){ Fail "$label ($host): cannot query $svcName - $($_.Exception.Message)" } else { Warn "$label ($host): cannot query $svcName - $($_.Exception.Message)" } }
+}
+Check-Service 'CAS'            $casSrv 'SMS_EXECUTIVE' $true
+Check-Service 'CAS'            $casSrv 'SMS_SITE_COMPONENT_MANAGER' $true
+Check-Service 'PS1'            $psSrv  'SMS_EXECUTIVE' $true
+Check-Service 'PS1'            $psSrv  'SMS_SITE_COMPONENT_MANAGER' $true
+Check-Service 'SEC'            $secSrv 'SMS_EXECUTIVE' $true
+Check-Service 'SEC'            $secSrv 'SMS_SITE_COMPONENT_MANAGER' $true
+Check-Service 'PS1 passive'    $psvHost 'SMS_EXECUTIVE' $false
+
+# ---- 5. Site system roles (hierarchy-wide via SMS_SystemResourceList) ------
+Section "Site system roles"
+$allRoles = $null
+try { $allRoles = Get-CimInstance -ComputerName $provSrv -Namespace $provNs -ClassName SMS_SystemResourceList -ErrorAction Stop } catch { Warn "Could not enumerate SMS_SystemResourceList: $($_.Exception.Message)" }
+function Has-Role($roleName, $host, $siteCode){
+    if(-not $allRoles){ return $null }
+    $h = (FQDN $host)
+    [bool]($allRoles | Where-Object {
+        $_.RoleName -eq $roleName -and
+        ($_.ServerName -ieq $h -or $_.ServerName -ieq $host) -and
+        ((-not $siteCode) -or ($_.SiteCode -eq $siteCode))
+    })
+}
+function Assert-Role($label, $roleName, $host, $siteCode){
+    $r = Has-Role $roleName $host $siteCode
+    if($null -eq $r){ Warn "$label : role list unavailable, skipped ($roleName on $host)"; return }
+    if($r){ Pass "$label : $roleName on $host" } else { Fail "$label : $roleName MISSING on $host" }
+}
+# CAS roles
+Assert-Role 'CAS' 'SMS SQL Server'      $casSql $casCode
+Assert-Role 'CAS' 'SMS Dmp Connector'   $scpHost $casCode
+Assert-Role 'CAS' 'SMS Site Server'     $casSrv $casCode
+# PS1 roles
+Assert-Role 'PS1' 'SMS SQL Server'      $psSql $psCode
+Assert-Role 'PS1' 'SMS Management Point' $mpHost $psCode
+Assert-Role 'PS1' 'SMS Distribution Point' $dpHost $psCode
+Assert-Role 'PS1' 'SMS Provider'        $smsHost $psCode
+Assert-Role 'PS1' 'SMS Site Server'     $psvHost $psCode
+# SEC roles
+Assert-Role 'SEC' 'SMS Management Point' $secSrv $secCode
+Assert-Role 'SEC' 'SMS Distribution Point' $secSrv $secCode
+
+# ---- 6. Database replication ----------------------------------------------
+Section "Database replication links"
+try{
+    $links = Get-CimInstance -ComputerName $provSrv -Namespace $provNs -ClassName SMS_ReplicationLink -ErrorAction Stop
+    if(-not $links){ Warn "No SMS_ReplicationLink instances found" }
+    foreach($l in $links){
+        $desc = "$($l.Site1) <-> $($l.Site2)"
+        # LinkStatus: 2 = Active (link healthy)
+        if([int]$l.LinkStatus -eq 2){ Pass "Replication $desc : Active" }
+        else {
+            $msg = "Replication $desc : LinkStatus=$($l.LinkStatus) (expected 2=Active)"
+            if($replMustBeActive){ Fail $msg } else { Warn $msg }
+        }
+    }
+} catch { Warn "Could not query SMS_ReplicationLink: $($_.Exception.Message)" }
+
+# ---- 7. Component health per site -----------------------------------------
+Section "Component health"
+foreach($sc in @($casCode,$psCode,$secCode)){
+    try{
+        $cs = Get-CimInstance -ComputerName $provSrv -Namespace $provNs -ClassName SMS_ComponentSummarizer -Filter "SiteCode='$sc'" -ErrorAction Stop
+        # Status: 0=OK, 1=Warning, 2=Critical
+        $crit = @($cs | Where-Object { [int]$_.Status -eq 2 })
+        $wrn  = @($cs | Where-Object { [int]$_.Status -eq 1 })
+        if($crit.Count -gt 0){ foreach($c in $crit){ Fail "$sc CRITICAL component: $($c.ComponentName) on $($c.MachineName)" } }
+        else { Pass "$sc : no components in Critical state" }
+        if($wrn.Count -gt 0){ Warn "$sc : $($wrn.Count) component(s) in Warning state" }
+    } catch { Warn "$sc : could not query SMS_ComponentSummarizer - $($_.Exception.Message)" }
+}
+
+# ---- 8. Update / upgrade state (informational) ----------------------------
+Section "Site update packages (informational)"
+try{
+    $ups = Get-CimInstance -ComputerName $provSrv -Namespace $provNs -ClassName SMS_CM_UpdatePackages -ErrorAction Stop
+    if(-not $ups){ Write-Output "  (none)" }
+    foreach($u in ($ups | Sort-Object FullVersion)){ Write-Output ("  {0} | ver={1} | state={2}" -f $u.Name, $u.FullVersion, $u.State) }
+} catch { Warn "Could not query SMS_CM_UpdatePackages: $($_.Exception.Message)" }
+
+# ---- Result ---------------------------------------------------------------
+Section "RESULT"
+Write-Output ("Failures: {0}  Warnings: {1}" -f $script:fails.Count, $script:warns.Count)
+if($script:warns.Count -gt 0){ foreach($w in $script:warns){ Write-Output "  WARN: $w" } }
+if($script:fails.Count -gt 0){
+    foreach($f in $script:fails){ Write-Output "  FAIL: $f" }
+    Write-Output "VALIDATION_RESULT=FAIL"
+    exit 1
+}
+Write-Output "VALIDATION_RESULT=PASS"
+exit 0

@@ -1,0 +1,50 @@
+---
+# validate_hierarchy defaults
+#
+# Expected topology. These default to the same ludus_sccm_* variables the install
+# roles use, so in the standard lab you don't need to set anything. Override any of
+# them if you customized new-config.yml.
+
+# Domain the hierarchy lives in (e.g. mayyhem.com)
+ludus_sccm_validate_domain_fqdn: "{{ ludus_domain_fqdn | default('mayyhem.com') }}"
+
+# Site codes
+ludus_sccm_validate_cas_sitecode: "{{ ludus_sccm_parent_sitecode | default('CAS') }}"
+ludus_sccm_validate_primary_sitecode: "{{ ludus_sccm_sitecode | default('PS1') }}"
+ludus_sccm_validate_secondary_sitecode: "{{ ludus_sccm_secondary_sitecode | default('SEC') }}"
+
+# Site servers (short hostnames)
+ludus_sccm_validate_cas_server: "{{ ludus_sccm_parent_site_server_hostname | default('cas-pss') }}"
+ludus_sccm_validate_primary_server: "{{ ludus_sccm_site_server_hostname | default('ps1-pss') }}"
+ludus_sccm_validate_secondary_server: "{{ (ludus_sccm_secondary_siteserver_fqdn | default('ps1-sec.' ~ ludus_sccm_validate_domain_fqdn)).split('.')[0] }}"
+
+# CAS site-system roles
+ludus_sccm_validate_cas_sql_host: "cas-db"
+ludus_sccm_validate_scp_host: "{{ ludus_sccm_scp_hostname | default('cas-scp') }}"
+
+# PS1 site-system roles
+ludus_sccm_validate_primary_sql_host: "{{ ludus_sccm_sql_server_hostname | default('ps1-db') }}"
+ludus_sccm_validate_mp_host: "{{ ludus_sccm_mgmt_server_hostname | default('ps1-mp') }}"
+ludus_sccm_validate_dp_host: "{{ ludus_sccm_distro_server_hostname | default('ps1-dp') }}"
+ludus_sccm_validate_sms_provider_host: "{{ ludus_sccm_sms_provider_hostname | default('ps1-sms') }}"
+ludus_sccm_validate_passive_host: "{{ ludus_sccm_passive_hostname | default('ps1-psv') }}"
+ludus_sccm_validate_contentlib_host: "{{ ludus_sccm_contentlib_hostname | default('ps1-lib') }}"
+
+# If set (e.g. "5.00.9135.1000"), every site must report exactly this build.
+# Leave empty to only require that all sites agree on the same version.
+ludus_sccm_validate_expected_version: ""
+
+# Require every site to be on the same build (catches half-finished upgrades where
+# CAS moved to 2503 but PS1/SEC are still on 2303).
+ludus_sccm_validate_require_version_consistency: true
+
+# Treat replication links that are not "Active" as a hard failure (vs. a warning).
+ludus_sccm_validate_replication_must_be_active: true
+
+# Fail the play when any critical check fails. Set false to report only.
+ludus_sccm_validate_fail_on_error: true
+
+# Retry the whole validation this many times (replication/components can lag right
+# after an install or upgrade), waiting delay seconds between tries.
+ludus_sccm_validate_retries: 10
+ludus_sccm_validate_delay_seconds: 30
