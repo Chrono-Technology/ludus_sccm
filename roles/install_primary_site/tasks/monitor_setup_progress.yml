@@ -1,0 +1,55 @@
+---
+# Recursive poll loop for ConfigMgr primary-site setup.
+#
+# Runs C:\sccm_monitor.ps1 once per cycle and PRINTS its output every time
+# (rc 2 = still running, and the script now emits a live ConfigMgrSetup.log
+# tail), so the deploy shows real installation progress instead of a silent
+# `until`/`retries` wait. Exits on rc 0 (complete) or rc 1 (failed/stalled).
+#
+# self-limits via sccm_monitor_iter (reset to 0 before the first include in
+# install_sccm.yml). Depth == number of 1-minute checks.
+
+- name: Increment setup monitor iteration counter
+  ansible.builtin.set_fact:
+    sccm_monitor_iter: "{{ (sccm_monitor_iter | default(0) | int) + 1 }}"
+
+- name: Poll ConfigMgr setup status
+  ansible.windows.win_shell: C:\sccm_monitor.ps1
+  register: monitor_result
+  changed_when: false
+  failed_when: false
+  vars:
+    ansible_become: true
+    ansible_become_method: runas
+    ansible_become_user: '{{ ludus_domain_netbios_name }}\{{ defaults.ad_domain_admin }}'
+    ansible_become_password: '{{ defaults.ad_domain_admin_password }}'
+    ansible_become_flags: "logon_type=interactive logon_flags=with_profile"
+
+- name: "ConfigMgr setup progress (check {{ sccm_monitor_iter }}, rc={{ monitor_result.rc }})"
+  ansible.builtin.debug:
+    msg: "{{ monitor_result.stdout_lines | default(['(no output)']) }}"
+
+- name: Fail if ConfigMgr setup reported failure
+  ansible.builtin.fail:
+    msg: "ConfigMgr setup failed/stalled (rc=1) after {{ sccm_monitor_iter }} check(s) - see the log tail above."
+  when: monitor_result.rc == 1
+
+- name: Keep monitoring while setup is still running
+  when:
+    - monitor_result.rc not in [0, 1]
+    - (sccm_monitor_iter | int) < (ludus_sccm_install_monitor_max_checks | default(130) | int)
+  block:
+    - name: Wait before next check
+      ansible.builtin.pause:
+        seconds: 60
+    - name: Re-check setup status
+      ansible.builtin.include_tasks: monitor_setup_progress.yml
+
+- name: Fail if setup did not complete within the monitor window
+  ansible.builtin.fail:
+    msg: >-
+      ConfigMgr setup still running after {{ sccm_monitor_iter }} checks
+      (~{{ sccm_monitor_iter }} minutes) - giving up.
+  when:
+    - monitor_result.rc not in [0, 1]
+    - (sccm_monitor_iter | int) >= (ludus_sccm_install_monitor_max_checks | default(130) | int)

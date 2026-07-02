@@ -251,6 +251,10 @@
           }
           
           Write-Output "Setup in progress - continuing to monitor"
+          Write-Output "`n=== ConfigMgrSetup.log (last 15 lines) ==="
+          if (Test-Path $setupLog) {
+              try { Get-Content $setupLog -Tail 15 -ErrorAction Stop | ForEach-Object { Write-Output $_ } } catch {}
+          }
           $host.SetShouldExit(2)
           exit 2
       } catch {
@@ -302,19 +306,15 @@
     msg: "Setup process failed to start after 50 seconds"
   when: setup_start_check.rc != 0
 
-- name: Monitor setup process (attempt {{ attempt_number }})
-  ansible.windows.win_shell: C:\sccm_monitor.ps1
-  register: monitor_result
-  until: monitor_result.rc == 0 or monitor_result.rc == 1
-  retries: 120 # Check for up to 2 hours
-  delay: 60 # Check every minute
-  failed_when: monitor_result.rc == 1
-  vars:
-    ansible_become: true
-    ansible_become_method: runas
-    ansible_become_user: '{{ ludus_domain_netbios_name }}\{{ defaults.ad_domain_admin }}'
-    ansible_become_password: '{{ defaults.ad_domain_admin_password }}'
-    ansible_become_flags: "logon_type=interactive logon_flags=with_profile"
+- name: Reset setup monitor iteration counter (attempt {{ attempt_number }})
+  ansible.builtin.set_fact:
+    sccm_monitor_iter: 0
+
+# Poll C:\sccm_monitor.ps1 on a recursive loop so each check's output
+# (including the live ConfigMgrSetup.log tail) is printed, instead of the
+# silent `until` retry that hid all progress until the loop finished.
+- name: Monitor setup process with live progress (attempt {{ attempt_number }})
+  ansible.builtin.include_tasks: monitor_setup_progress.yml
 
 - name: Verify SMS_EXECUTIVE is running (attempt {{ attempt_number }})
   ansible.windows.win_service_info:
