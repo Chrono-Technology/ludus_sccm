@@ -36,6 +36,46 @@
     msg: "SMS Provider already installed on {{ ludus_sccm_sms_provider_hostname }}.{{ ludus_domain_fqdn }}; skipping setup."
   when: sms_provider_exists | bool
 
+# The remote SMS Provider setup (setup.exe /SDKINST) runs a prereq check
+# against the provider host and requires ADK 'Deployment Tools' there. If it's
+# missing, setup blocks on a GUI error dialog and the wait loop below spins
+# silently for 30 minutes. Verify ADK on the provider first and fail fast with
+# an actionable message (prep_sms is what installs ADK on that host).
+- name: Verify ADK Deployment Tools present on SMS Provider host
+  ansible.windows.win_powershell:
+    script: |
+      $ErrorActionPreference = 'Stop'
+      $provider = "{{ ludus_sccm_sms_provider_hostname }}.{{ ludus_domain_fqdn }}"
+      $adkPath = "C:\Program Files (x86)\Windows Kits\10\Assessment and Deployment Kit\Deployment Tools"
+      try {
+        $present = Invoke-Command -ComputerName $provider -ScriptBlock { param($p) Test-Path $p } -ArgumentList $adkPath -ErrorAction Stop
+      } catch {
+        $present = $false
+      }
+      @{ present = [bool]$present } | ConvertTo-Json -Compress
+  register: adk_provider_check
+  changed_when: false
+  failed_when: false
+  when: not (sms_provider_exists | bool)
+  vars:
+    ansible_become: true
+    ansible_become_method: runas
+    ansible_become_user: '{{ ludus_domain_netbios_name }}\{{ defaults.ad_domain_admin }}'
+    ansible_become_password: '{{ defaults.ad_domain_admin_password }}'
+    ansible_become_flags: "logon_type=interactive logon_flags=with_profile"
+
+- name: Fail early if ADK is missing on the SMS Provider host
+  ansible.builtin.fail:
+    msg: >-
+      ADK 'Deployment Tools' is not installed on the SMS Provider host
+      ({{ ludus_sccm_sms_provider_hostname }}.{{ ludus_domain_fqdn }}).
+      setup.exe /SDKINST requires it and will hang on a silent prereq dialog
+      without it. Ensure the prep_sms role (which installs ADK) has completed
+      on that host before install_sms runs.
+  when:
+    - not (sms_provider_exists | bool)
+    - not ((adk_provider_check.output | default([]) | join('') | length > 0) and ((adk_provider_check.output | default([]) | join('') | from_json).present | default(false)))
+
 - name: Start SCCM SMS Provider setup in background
   ansible.windows.win_shell: |
     Start-Process -FilePath 'C:\Program Files\Microsoft Configuration Manager\bin\X64\setup.exe' -ArgumentList '/SDKINST','{{ ludus_sccm_sms_provider_hostname }}.{{ ludus_domain_fqdn }}' -NoNewWindow
