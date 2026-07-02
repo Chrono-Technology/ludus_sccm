@@ -37,22 +37,23 @@
   when: sms_provider_exists | bool
 
 # The remote SMS Provider setup (setup.exe /SDKINST) runs a prereq check
-# against the provider host and requires ADK 'Deployment Tools' there. If it's
-# missing, setup blocks on a GUI error dialog and the wait loop below spins
-# silently for 30 minutes. Verify ADK on the provider first and fail fast with
-# an actionable message (prep_sms is what installs ADK on that host).
-- name: Verify ADK Deployment Tools present on SMS Provider host
+# against the provider host and requires ADK 'Deployment Tools' (+ WinPE) there.
+# If it's missing, setup blocks on a GUI error dialog and the wait loop below
+# spins silently for 30 minutes. Rather than depend solely on prep_sms having
+# run, ensure ADK is present on the provider here and auto-install it if not.
+- name: Check ADK on SMS Provider host
   ansible.windows.win_powershell:
     script: |
       $ErrorActionPreference = 'Stop'
       $provider = "{{ ludus_sccm_sms_provider_hostname }}.{{ ludus_domain_fqdn }}"
-      $adkPath = "C:\Program Files (x86)\Windows Kits\10\Assessment and Deployment Kit\Deployment Tools"
+      $dt = "C:\Program Files (x86)\Windows Kits\10\Assessment and Deployment Kit\Deployment Tools"
+      $pe = "C:\Program Files (x86)\Windows Kits\10\Assessment and Deployment Kit\Windows Preinstallation Environment"
       try {
-        $present = Invoke-Command -ComputerName $provider -ScriptBlock { param($p) Test-Path $p } -ArgumentList $adkPath -ErrorAction Stop
+        $r = Invoke-Command -ComputerName $provider -ScriptBlock { param($a,$b) @{ dt = (Test-Path $a); pe = (Test-Path $b) } } -ArgumentList $dt,$pe -ErrorAction Stop
       } catch {
-        $present = $false
+        $r = @{ dt = $false; pe = $false }
       }
-      @{ present = [bool]$present } | ConvertTo-Json -Compress
+      @{ dt = [bool]$r.dt; pe = [bool]$r.pe } | ConvertTo-Json -Compress
   register: adk_provider_check
   changed_when: false
   failed_when: false
@@ -64,17 +65,77 @@
     ansible_become_password: '{{ defaults.ad_domain_admin_password }}'
     ansible_become_flags: "logon_type=interactive logon_flags=with_profile"
 
-- name: Fail early if ADK is missing on the SMS Provider host
-  ansible.builtin.fail:
-    msg: >-
-      ADK 'Deployment Tools' is not installed on the SMS Provider host
-      ({{ ludus_sccm_sms_provider_hostname }}.{{ ludus_domain_fqdn }}).
-      setup.exe /SDKINST requires it and will hang on a silent prereq dialog
-      without it. Ensure the prep_sms role (which installs ADK) has completed
-      on that host before install_sms runs.
+- name: Set fact for ADK presence on SMS Provider
+  ansible.builtin.set_fact:
+    adk_present_on_provider: "{{ (adk_provider_check.output | default([]) | join('') | length > 0) and ((adk_provider_check.output | default([]) | join('') | from_json).dt | default(false)) and ((adk_provider_check.output | default([]) | join('') | from_json).pe | default(false)) }}"
+  when: not (sms_provider_exists | bool)
+
+- name: Auto-install ADK (Deployment Tools + WinPE) on SMS Provider if missing
+  ansible.windows.win_powershell:
+    script: |
+      $ErrorActionPreference = 'Stop'
+      $provider = "{{ ludus_sccm_sms_provider_hostname }}.{{ ludus_domain_fqdn }}"
+      $adkUrl = "{{ adksetup_url | default('https://download.microsoft.com/download/e/8/b/e8bec6c1-8153-408d-96b1-ee2985a600ad/adk/adksetup.exe') }}"
+      $winpeUrl = "{{ adkwinpesetup_url | default('https://download.microsoft.com/download/17ac4263-5816-4f1b-8131-87c4d5a3331f/adkwinpeaddons/adkwinpesetup.exe') }}"
+      $inner = @"
+      `$ErrorActionPreference='Stop'
+      [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12
+      `$dir='C:\ludus\sccm'
+      New-Item -ItemType Directory -Force -Path `$dir | Out-Null
+      `$dt='C:\Program Files (x86)\Windows Kits\10\Assessment and Deployment Kit\Deployment Tools'
+      `$pe='C:\Program Files (x86)\Windows Kits\10\Assessment and Deployment Kit\Windows Preinstallation Environment'
+      try {
+        if(-not (Test-Path `$dt)){
+          if(-not (Test-Path "`$dir\adksetup.exe")){ Invoke-WebRequest -UseBasicParsing -Uri '$adkUrl' -OutFile "`$dir\adksetup.exe" }
+          Start-Process "`$dir\adksetup.exe" -ArgumentList '/quiet','/ceip','off','/features','OptionId.DeploymentTools','OptionId.UserStateMigrationTool' -Wait
+        }
+        if(-not (Test-Path `$pe)){
+          if(-not (Test-Path "`$dir\adkwinpesetup.exe")){ Invoke-WebRequest -UseBasicParsing -Uri '$winpeUrl' -OutFile "`$dir\adkwinpesetup.exe" }
+          Start-Process "`$dir\adkwinpesetup.exe" -ArgumentList '/quiet','/ceip','off','/features','OptionId.WindowsPreinstallationEnvironment' -Wait
+        }
+        'DONE' | Out-File 'C:\ludus\adk_autoinstall_done.txt'
+      } catch { `$_.Exception.Message | Out-File 'C:\ludus\adk_autoinstall_done.txt' }
+      "@
+      $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($inner))
+      Invoke-Command -ComputerName $provider -ScriptBlock {
+        param($b64)
+        New-Item -ItemType Directory -Force -Path 'C:\ludus' | Out-Null
+        $p = 'C:\ludus\adk_autoinstall.ps1'
+        [IO.File]::WriteAllBytes($p, [Convert]::FromBase64String($b64))
+        Remove-Item 'C:\ludus\adk_autoinstall_done.txt' -ErrorAction SilentlyContinue
+        Start-Process powershell -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',$p -WindowStyle Hidden
+      } -ArgumentList $b64
+  changed_when: true
   when:
     - not (sms_provider_exists | bool)
-    - not ((adk_provider_check.output | default([]) | join('') | length > 0) and ((adk_provider_check.output | default([]) | join('') | from_json).present | default(false)))
+    - not (adk_present_on_provider | bool)
+  vars:
+    ansible_become: true
+    ansible_become_method: runas
+    ansible_become_user: '{{ ludus_domain_netbios_name }}\{{ defaults.ad_domain_admin }}'
+    ansible_become_password: '{{ defaults.ad_domain_admin_password }}'
+    ansible_become_flags: "logon_type=interactive logon_flags=with_profile"
+
+- name: Wait for ADK install to complete on SMS Provider host
+  ansible.windows.win_shell: |
+    $provider = "{{ ludus_sccm_sms_provider_hostname }}.{{ ludus_domain_fqdn }}"
+    $dt = "C:\Program Files (x86)\Windows Kits\10\Assessment and Deployment Kit\Deployment Tools"
+    $pe = "C:\Program Files (x86)\Windows Kits\10\Assessment and Deployment Kit\Windows Preinstallation Environment"
+    $ok = Invoke-Command -ComputerName $provider -ScriptBlock { param($a,$b) (Test-Path $a) -and (Test-Path $b) } -ArgumentList $dt,$pe
+    if ($ok) { Write-Output "ADK present on $provider"; exit 0 } else { Write-Output "waiting for ADK install on $provider"; exit 1 }
+  register: adk_wait
+  until: adk_wait.rc == 0
+  retries: 45
+  delay: 60
+  when:
+    - not (sms_provider_exists | bool)
+    - not (adk_present_on_provider | bool)
+  vars:
+    ansible_become: true
+    ansible_become_method: runas
+    ansible_become_user: '{{ ludus_domain_netbios_name }}\{{ defaults.ad_domain_admin }}'
+    ansible_become_password: '{{ defaults.ad_domain_admin_password }}'
+    ansible_become_flags: "logon_type=interactive logon_flags=with_profile"
 
 - name: Start SCCM SMS Provider setup in background
   ansible.windows.win_shell: |
