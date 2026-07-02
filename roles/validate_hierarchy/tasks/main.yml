@@ -1,0 +1,45 @@
+---
+# Validate that the CAS -> PS1 -> SEC SCCM hierarchy came up correctly.
+# Intended to run last (after install_secondary_site / install_passive_site_server),
+# and again after an in-console upgrade to confirm every tier moved to the new build.
+
+- name: Render SCCM hierarchy validation script
+  ansible.windows.win_template:
+    src: validate_hierarchy.ps1.j2
+    dest: C:\sccm_validate_hierarchy.ps1
+    force: yes
+  vars:
+    ansible_become: true
+    ansible_become_method: runas
+    ansible_become_user: '{{ ludus_domain_netbios_name }}\{{ defaults.ad_domain_admin }}'
+    ansible_become_password: '{{ defaults.ad_domain_admin_password }}'
+    ansible_become_flags: "logon_type=interactive logon_flags=with_profile"
+
+- name: Validate SCCM hierarchy (sites, roles, providers, replication, versions)
+  ansible.windows.win_shell: powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\sccm_validate_hierarchy.ps1
+  register: sccm_validation
+  changed_when: false
+  failed_when: false
+  retries: "{{ ludus_sccm_validate_retries | int }}"
+  delay: "{{ ludus_sccm_validate_delay_seconds | int }}"
+  until: sccm_validation.rc == 0
+  vars:
+    ansible_become: true
+    ansible_become_method: runas
+    ansible_become_user: '{{ ludus_domain_netbios_name }}\{{ defaults.ad_domain_admin }}'
+    ansible_become_password: '{{ defaults.ad_domain_admin_password }}'
+    ansible_become_flags: "logon_type=interactive logon_flags=with_profile"
+
+- name: Show SCCM hierarchy validation report
+  ansible.builtin.debug:
+    msg: "{{ sccm_validation.stdout_lines | default(['(no output)']) }}"
+
+- name: Fail if SCCM hierarchy validation reported errors
+  ansible.builtin.fail:
+    msg: >-
+      SCCM hierarchy validation FAILED after {{ ludus_sccm_validate_retries }} attempt(s).
+      Review the [FAIL] lines in the report above (also saved to
+      C:\sccm_validate_hierarchy.ps1 output on {{ inventory_hostname }}).
+  when:
+    - ludus_sccm_validate_fail_on_error | bool
+    - sccm_validation.rc != 0

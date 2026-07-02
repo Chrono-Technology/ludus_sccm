@@ -603,11 +603,20 @@ ludus:
         # Wait for site installation and secondary site server prep before installing secondary site
         depends_on:
           - vm_name: "{{ range_id }}-ps1-pss"
-            role: mayyhem.ludus_sccm.install_primary_site    
+            role: mayyhem.ludus_sccm.install_primary_site
           - vm_name: "{{ range_id }}-ps1-sec"
             role: mayyhem.ludus_sccm.prep_siteserver
           - vm_name: "{{ range_id }}-ps1-sec"
             role: mayyhem.ludus_sccm.add_pss_to_admins
+      # Validate the whole CAS -> PS1 -> SEC hierarchy last (also re-runnable after an upgrade)
+      - name: mayyhem.ludus_sccm.validate_hierarchy
+        depends_on:
+          - vm_name: "{{ range_id }}-ps1-pss"
+            role: mayyhem.ludus_sccm.install_secondary_site
+          - vm_name: "{{ range_id }}-ps1-pss"
+            role: mayyhem.ludus_sccm.install_passive_site_server
+          - vm_name: "{{ range_id }}-ps1-pss"
+            role: mayyhem.ludus_sccm.install_sms
     role_vars:
       # This is a child site of CAS
       ludus_sccm_parent_sitecode: 'CAS'
